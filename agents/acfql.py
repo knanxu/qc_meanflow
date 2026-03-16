@@ -51,31 +51,36 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             'q_min': q.min(),
         }
 
-    def actor_loss(self, batch, grad_params, rng):
+    def actor_loss(self, batch, grad_params, rng, offline_batch=None):
         """Compute the FQL actor loss."""
+        # Use offline_batch for BC flow loss if provided (separate_bc_buffer mode).
+        bc_batch = offline_batch if offline_batch is not None else batch
+
         if self.config["action_chunking"]:
             batch_actions = jnp.reshape(batch["actions"], (batch["actions"].shape[0], -1))  # fold in horizon_length together with action_dim
+            bc_actions = jnp.reshape(bc_batch["actions"], (bc_batch["actions"].shape[0], -1))
         else:
             batch_actions = batch["actions"][..., 0, :] # take the first one
+            bc_actions = bc_batch["actions"][..., 0, :]
         batch_size, action_dim = batch_actions.shape
         rng, x_rng, t_rng = jax.random.split(rng, 3)
 
-        # BC flow loss.
+        # BC flow loss (on offline data).
         x_0 = jax.random.normal(x_rng, (batch_size, action_dim))
-        x_1 = batch_actions
+        x_1 = bc_actions
         t = jax.random.uniform(t_rng, (batch_size, 1))
         x_t = (1 - t) * x_0 + t * x_1
         vel = x_1 - x_0
 
-        pred = self.network.select('actor_bc_flow')(batch['observations'], x_t, t, params=grad_params)
+        pred = self.network.select('actor_bc_flow')(bc_batch['observations'], x_t, t, params=grad_params)
 
         # only bc on the valid chunk indices
         if self.config["action_chunking"]:
             bc_flow_loss = jnp.mean(
                 jnp.reshape(
-                    (pred - vel) ** 2, 
-                    (batch_size, self.config["horizon_length"], self.config["action_dim"]) 
-                ) * batch["valid"][..., None]
+                    (pred - vel) ** 2,
+                    (batch_size, self.config["horizon_length"], self.config["action_dim"])
+                ) * bc_batch["valid"][..., None]
             )
         else:
             bc_flow_loss = jnp.mean(jnp.square(pred - vel))
@@ -108,7 +113,7 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         }
 
     @jax.jit
-    def total_loss(self, batch, grad_params, rng=None):
+    def total_loss(self, batch, grad_params, rng=None, offline_batch=None):
         """Compute the total loss."""
         info = {}
         rng = rng if rng is not None else self.rng
@@ -119,7 +124,7 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         for k, v in critic_info.items():
             info[f'critic/{k}'] = v
 
-        actor_loss, actor_info = self.actor_loss(batch, grad_params, actor_rng)
+        actor_loss, actor_info = self.actor_loss(batch, grad_params, actor_rng, offline_batch=offline_batch)
         for k, v in actor_info.items():
             info[f'actor/{k}'] = v
 
@@ -147,15 +152,32 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         agent.target_update(new_network, 'critic')
         return agent.replace(network=new_network, rng=new_rng), info
 
+    @staticmethod
+    def _update_with_offline(agent, data):
+        """Update the agent with separate offline batch for BC."""
+        batch, offline_batch = data
+        new_rng, rng = jax.random.split(agent.rng)
+
+        def loss_fn(grad_params):
+            return agent.total_loss(batch, grad_params, rng=rng, offline_batch=offline_batch)
+
+        new_network, info = agent.network.apply_loss_fn(loss_fn=loss_fn)
+        agent.target_update(new_network, 'critic')
+        return agent.replace(network=new_network, rng=new_rng), info
+
     @jax.jit
-    def update(self, batch):
+    def update(self, batch, offline_batch=None):
+        if offline_batch is not None:
+            return self._update_with_offline(self, (batch, offline_batch))
         return self._update(self, batch)
-    
+
     @jax.jit
-    def batch_update(self, batch):
+    def batch_update(self, batch, offline_batch=None):
         """Update the agent and return a new agent with information dictionary."""
-        # update_size = batch["observations"].shape[0]
-        agent, infos = jax.lax.scan(self._update, self, batch)
+        if offline_batch is not None:
+            agent, infos = jax.lax.scan(self._update_with_offline, self, (batch, offline_batch))
+        else:
+            agent, infos = jax.lax.scan(self._update, self, batch)
         return agent, jax.tree_util.tree_map(lambda x: x.mean(), infos)
     
     @jax.jit

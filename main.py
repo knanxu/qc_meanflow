@@ -51,6 +51,7 @@ flags.DEFINE_integer('horizon_length', 5, 'action chunking length.')
 flags.DEFINE_bool('sparse', False, "make the task sparse reward")
 
 flags.DEFINE_bool('save_all_online_states', False, "save all trajectories to npy")
+flags.DEFINE_bool('separate_bc_buffer', False, "use offline-only data for BC flow loss during online phase")
 
 class LoggingHelper:
     def __init__(self, csv_loggers, wandb_logger):
@@ -283,12 +284,19 @@ def main(_):
             ob = next_ob
 
         if i >= FLAGS.start_training:
-            batch = replay_buffer.sample_sequence(config['batch_size'] * FLAGS.utd_ratio, 
+            batch = replay_buffer.sample_sequence(config['batch_size'] * FLAGS.utd_ratio,
                         sequence_length=FLAGS.horizon_length, discount=discount)
             batch = jax.tree.map(lambda x: x.reshape((
                 FLAGS.utd_ratio, config["batch_size"]) + x.shape[1:]), batch)
 
-            agent, update_info["online_agent"] = agent.batch_update(batch)
+            if FLAGS.separate_bc_buffer:
+                offline_batch = train_dataset.sample_sequence(config['batch_size'] * FLAGS.utd_ratio,
+                            sequence_length=FLAGS.horizon_length, discount=discount)
+                offline_batch = jax.tree.map(lambda x: x.reshape((
+                    FLAGS.utd_ratio, config["batch_size"]) + x.shape[1:]), offline_batch)
+                agent, update_info["online_agent"] = agent.batch_update(batch, offline_batch=offline_batch)
+            else:
+                agent, update_info["online_agent"] = agent.batch_update(batch)
             
         if i % FLAGS.log_interval == 0:
             for key, info in update_info.items():
