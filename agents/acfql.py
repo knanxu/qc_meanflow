@@ -87,30 +87,63 @@ class ACFQLAgent(flax.struct.PyTreeNode):
 
         if self.config["actor_type"] == "distill-ddpg":
             # Distillation loss.
-            rng, noise_rng = jax.random.split(rng)
-            noises = jax.random.normal(noise_rng, (batch_size, action_dim))
-            target_flow_actions = self.compute_flow_actions(batch['observations'], noises=noises)
-            actor_actions = self.network.select('actor_onestep_flow')(batch['observations'], noises, params=grad_params)
-            distill_loss = jnp.mean((actor_actions - target_flow_actions) ** 2)
-            
+            if self.config['distill_best_of_n']:
+                # Best-of-N: sample N noises for bc_flow, 1 noise for one_step, pick closest.
+                rng, noise_rng, onestep_noise_rng = jax.random.split(rng, 3)
+                N = self.config['distill_n_samples']
+                bc_noises = jax.random.normal(noise_rng, (batch_size, N, action_dim))
+                obs_repeated = jnp.repeat(batch['observations'][:, None, :], N, axis=1)
+                bc_noises_flat = bc_noises.reshape(batch_size * N, action_dim)
+                obs_flat = obs_repeated.reshape(batch_size * N, *batch['observations'].shape[1:])
+                bc_actions_flat = self.compute_flow_actions(obs_flat, bc_noises_flat)
+                bc_actions_all = bc_actions_flat.reshape(batch_size, N, action_dim)
+
+                noise = jax.random.normal(onestep_noise_rng, (batch_size, action_dim))
+                actor_actions = self.network.select('actor_onestep_flow')(batch['observations'], noise, params=grad_params)
+
+                dists = jnp.sum((bc_actions_all - actor_actions[:, None, :]) ** 2, axis=-1)  # (B, N)
+                best_idx = jnp.argmin(dists, axis=-1)  # (B,)
+                best_bc_action = bc_actions_all[jnp.arange(batch_size), best_idx]  # (B, action_dim)
+                distill_loss = jnp.mean((actor_actions - jax.lax.stop_gradient(best_bc_action)) ** 2)
+            else:
+                rng, noise_rng = jax.random.split(rng)
+                noises = jax.random.normal(noise_rng, (batch_size, action_dim))
+                target_flow_actions = self.compute_flow_actions(batch['observations'], noises=noises)
+                actor_actions = self.network.select('actor_onestep_flow')(batch['observations'], noises, params=grad_params)
+                distill_loss = jnp.mean((actor_actions - target_flow_actions) ** 2)
+
             # Q loss.
             actor_actions = jnp.clip(actor_actions, -1, 1)
 
-            qs = self.network.select(f'critic')(batch['observations'], actions=actor_actions)
-            q = jnp.mean(qs, axis=0)
-            q_loss = -q.mean()
+            qs = self.network.select('critic')(batch['observations'], actions=actor_actions)
+            if self.config['adaptive_q_weight']:
+                q_mean = jnp.mean(qs, axis=0)
+                q_var = jnp.var(qs, axis=0)
+                weights = 1.0 / (1.0 + self.config['adaptive_q_beta'] * q_var)
+                q_loss = -(weights * q_mean).mean()
+            else:
+                q = jnp.mean(qs, axis=0)
+                q_loss = -q.mean()
         else:
             distill_loss = jnp.zeros(())
             q_loss = jnp.zeros(())
+            qs = None
 
         # Total loss.
         actor_loss = bc_flow_loss + self.config['alpha'] * distill_loss + q_loss
 
-        return actor_loss, {
+        info = {
             'actor_loss': actor_loss,
             'bc_flow_loss': bc_flow_loss,
             'distill_loss': distill_loss,
         }
+        if self.config['adaptive_q_weight'] and qs is not None:
+            q_var = jnp.var(qs, axis=0)
+            weights = 1.0 / (1.0 + self.config['adaptive_q_beta'] * q_var)
+            info['q_var_mean'] = q_var.mean()
+            info['adaptive_q_weight_mean'] = weights.mean()
+
+        return actor_loss, info
 
     @jax.jit
     def total_loss(self, batch, grad_params, rng=None, offline_batch=None):
@@ -362,6 +395,10 @@ def get_config():
             use_fourier_features=False,
             fourier_feature_dim=64,
             weight_decay=0.,
+            distill_best_of_n=False,
+            distill_n_samples=20,
+            adaptive_q_weight=False,
+            adaptive_q_beta=1.0,
         )
     )
     return config
