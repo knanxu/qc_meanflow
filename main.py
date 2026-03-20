@@ -44,6 +44,10 @@ flags.DEFINE_integer('video_frame_skip', 3, 'Frame skip for videos.')
 config_flags.DEFINE_config_file('agent', 'agents/acfql.py', lock_config=False)#-----选取agent
 
 flags.DEFINE_float('dataset_proportion', 1.0, "Proportion of the dataset to use")
+flags.DEFINE_integer('dataset_num_episodes', 0, 'Number of complete episodes to keep from the dataset. 0 uses all episodes.')
+flags.DEFINE_enum('dataset_episode_selection', 'sequential', ['sequential', 'random'],
+                  'How to choose episodes when dataset_num_episodes > 0.')
+flags.DEFINE_integer('dataset_episode_seed', 0, 'Random seed used when dataset_episode_selection=random.')
 flags.DEFINE_integer('dataset_replace_interval', 1000, 'Dataset replace interval, used for large datasets because of memory constraints')
 flags.DEFINE_string('ogbench_dataset_dir', None, 'OGBench dataset directory')
 
@@ -64,6 +68,64 @@ class LoggingHelper:
         assert prefix in self.csv_loggers, prefix
         self.csv_loggers[prefix].log(data, step=step)
         self.wandb_logger.log({f'{prefix}/{k}': v for k, v in data.items()}, step=step)
+
+def subset_dataset_by_episodes(ds):
+    """Keep only the selected number of complete episodes from a dataset."""
+    ds = Dataset.create(**ds)
+
+    if FLAGS.dataset_num_episodes <= 0:
+        return ds
+
+    if FLAGS.dataset_proportion < 1.0:
+        raise ValueError('dataset_num_episodes and dataset_proportion cannot both be set.')
+    if ds.size == 0:
+        raise ValueError('dataset_num_episodes requires a non-empty dataset.')
+
+    if 'next_observations' in ds and ds.size > 1:
+        # Infer episode ends from observation discontinuities since some datasets
+        # mark success states as done for multiple trailing transitions.
+        obs_diffs = np.linalg.norm(
+            np.asarray(ds['next_observations'][:-1]).reshape(ds.size - 1, -1)
+            - np.asarray(ds['observations'][1:]).reshape(ds.size - 1, -1),
+            axis=1,
+        )
+        episode_end_locs = np.nonzero(obs_diffs > 1e-6)[0]
+        episode_end_locs = np.concatenate([episode_end_locs, [ds.size - 1]])
+    else:
+        episode_end_locs = np.nonzero(np.asarray(ds['terminals']) > 0)[0]
+        if len(episode_end_locs) == 0:
+            episode_end_locs = np.array([ds.size - 1])
+        elif episode_end_locs[-1] != ds.size - 1:
+            episode_end_locs = np.concatenate([episode_end_locs, [ds.size - 1]])
+
+    initial_locs = np.concatenate([[0], episode_end_locs[:-1] + 1])
+    num_episodes = len(episode_end_locs)
+    if FLAGS.dataset_num_episodes > num_episodes:
+        raise ValueError(
+            f'dataset_num_episodes={FLAGS.dataset_num_episodes} exceeds the available number of episodes ({num_episodes}).'
+        )
+
+    if FLAGS.dataset_episode_selection == 'sequential':
+        selected_episode_idxs = np.arange(FLAGS.dataset_num_episodes)
+    else:
+        rng = np.random.RandomState(FLAGS.dataset_episode_seed)
+        selected_episode_idxs = np.sort(
+            rng.choice(num_episodes, size=FLAGS.dataset_num_episodes, replace=False)
+        )
+
+    selected_transition_idxs = np.concatenate([
+        np.arange(initial_locs[ep_idx], episode_end_locs[ep_idx] + 1)
+        for ep_idx in selected_episode_idxs
+    ])
+
+    subset = Dataset.create(**{k: v[selected_transition_idxs] for k, v in ds.items()})
+    print(
+        f"Using {FLAGS.dataset_num_episodes}/{num_episodes} episodes "
+        f"({subset.size}/{ds.size} transitions) with selection={FLAGS.dataset_episode_selection}",
+        flush=True,
+    )
+    return subset
+
 
 def main(_):
     exp_name = get_exp_name(FLAGS.seed)
@@ -115,6 +177,7 @@ def main(_):
         """
 
         ds = Dataset.create(**ds)
+        ds = subset_dataset_by_episodes(ds)
         if FLAGS.dataset_proportion < 1.0:
             new_size = int(len(ds['masks']) * FLAGS.dataset_proportion)
             ds = Dataset.create(
