@@ -119,7 +119,10 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             if self.config['adaptive_q_weight']:
                 q_mean = jnp.mean(qs, axis=0)
                 q_var = jnp.var(qs, axis=0)
-                weights = 1.0 / (1.0 + self.config['adaptive_q_beta'] * q_var)
+                if self.config['q_weight_invert']:
+                    weights = (1.0 + self.config['adaptive_q_beta'] * q_var)
+                else:
+                    weights =  self.config['adaptive_q_beta'] * q_var / (1.0 + self.config['adaptive_q_beta'] * q_var)
                 weights = jax.lax.stop_gradient(weights)
                 q_loss = -(weights * q_mean).mean()
             else:
@@ -144,7 +147,7 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             if self.config['q_weight_invert']:
                 weights = (1.0 + self.config['adaptive_q_beta'] * q_var)
             else:
-                weights = 1.0 / (1.0 + self.config['adaptive_q_beta'] * q_var)
+                weights =  self.config['adaptive_q_beta'] * q_var / (1.0 + self.config['adaptive_q_beta'] * q_var)
             info['q_var_mean'] = q_var.mean()
             info['adaptive_q_weight_mean'] = weights.mean()
 
