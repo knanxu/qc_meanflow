@@ -141,7 +141,10 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         }
         if self.config['adaptive_q_weight'] and qs is not None:
             q_var = jnp.var(qs, axis=0)
-            weights = 1.0 / (1.0 + self.config['adaptive_q_beta'] * q_var)
+            if self.config['q_weight_invert']:
+                weights = (1.0 + self.config['adaptive_q_beta'] * q_var)
+            else:
+                weights = 1.0 / (1.0 + self.config['adaptive_q_beta'] * q_var)
             info['q_var_mean'] = q_var.mean()
             info['adaptive_q_weight_mean'] = weights.mean()
 
@@ -401,6 +404,7 @@ def get_config():
             distill_n_samples=20,
             adaptive_q_weight=False,
             adaptive_q_beta=1.0,
+            q_weight_invert= False,
         )
     )
     return config
